@@ -1269,8 +1269,18 @@ EvNatsService::parse_connect( const char *buf,  size_t bufsz ) noexcept
             cvt_number( mref, this->user.protocol );
           break;
         case NATS_JS_NAME: /* name:"str" */
-          if ( iter->get_reference( mref ) == 0 && mref.ftype == MD_STRING )
+          if ( iter->get_reference( mref ) == 0 && mref.ftype == MD_STRING ) {
             this->user.save_string( this->user.name, mref.fptr, mref.fsize );
+            if ( ! this->user.binary ) {
+              if ( ( mref.fsize >= sizeof( "_bin" ) &&
+                     ::memcmp( &((char *) mref.fptr)[ mref.fsize - 4 ], "_bin", 4 ) == 0 ) ||
+
+                   ( mref.fsize >= sizeof( "_binary" ) &&
+                     ::memcmp( &((char *) mref.fptr)[ mref.fsize - 7 ], "_binary", 7 ) == 0 ) ) {
+                this->user.binary = true;
+              }
+            }
+          }
           break;
         case NATS_JS_LANG: /* lang:"C" */
           if ( iter->get_reference( mref ) == 0 && mref.ftype == MD_STRING )
