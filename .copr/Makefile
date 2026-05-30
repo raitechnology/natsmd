@@ -6,9 +6,9 @@ rpmdir := $(shell pwd)
 
 git_hash    := $(shell git rev-parse --short=8 HEAD)
 major_num   := 1
-minor_num   := 29
+minor_num   := 30
 patch_num   := 0
-build_num   := 64
+build_num   := 65
 version     := $(major_num).$(minor_num).$(patch_num)
 ver_build   := $(version)-$(build_num)
 name_ver    := $(name)-$(ver_build)
@@ -28,8 +28,15 @@ rpmbuild/SOURCES/$(name_ver).tar.gz:
 	mkdir -p rpmbuild/RPMS rpmbuild/SRPMS rpmbuild/BUILD rpmbuild/SOURCES rpmbuild/SPECS
 	sed -e "s/99999/$(build_num)/" \
 	    -e "s/999.999/$(version)/" \
+	    -e "s/_raikv_dep/>= $(raikv_dep)/" \
+	    -e "s/_raimd_dep/>= $(raimd_dep)/" \
+            -e "s/_libdecnumber_dep/>= $(libdecnumber_dep)/" \
+            -e "s/_hdrhist_dep/>= $(hdrhist_dep)/" \
 	    -e "s/Sat Jan 01 2000/$(date)/" < rpm/$(name).spec > rpmbuild/SPECS/$(name).spec
 	mkdir -p $(rpm_src_dir)
 	for i in $(srctree) ; do ln -sf ../../../$$i $(rpm_src_dir) ; done
 	( cd rpmbuild/SOURCES && tar chzf $(name_ver).tar.gz --exclude=".*.sw*" $(name)-$(version) && rm -r -f $(name)-$(version) )
 
+.PHONY: spec_version
+spec_version:
+	@echo "$(name)_dep := $(major_num).$(minor_num)"

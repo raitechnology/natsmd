@@ -228,10 +228,11 @@ clean_hdr:
 clean_subs += clean_hdr
 endif
 
+# build depends for rpm spec file
+-include build_depends.mak
 # copr/fedora build (with version env vars)
 # copr uses this to generate a source rpm with the srpm target
 -include .copr/Makefile
-
 # debian build (debuild)
 # target for building installable deb: dist_dpkg
 -include deb/Makefile

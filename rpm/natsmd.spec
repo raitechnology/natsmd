@@ -11,11 +11,11 @@ BuildRoot:	${_tmppath}
 Prefix:	        /usr
 BuildRequires:  gcc-c++
 BuildRequires:  chrpath
-BuildRequires:  raikv
-BuildRequires:  raimd
-BuildRequires:  libdecnumber
+BuildRequires:  raikv _raikv_dep
+BuildRequires:  raimd _raimd_dep
+BuildRequires:  libdecnumber _libdecnumber_dep
 BuildRequires:  pcre2-devel
-BuildRequires:  hdrhist
+BuildRequires:  hdrhist _hdrhist_dep
 BuildRequires:  git-core
 BuildRequires:  c-ares-devel
 BuildRequires:  zlib-devel
