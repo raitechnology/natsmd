@@ -6,14 +6,14 @@ rpmdir := $(shell pwd)
 
 git_hash    := $(shell git rev-parse --short=8 HEAD)
 major_num   := 1
-minor_num   := 30
+minor_num   := 31
 patch_num   := 0
-build_num   := 65
+build_num   := 66
 version     := $(major_num).$(minor_num).$(patch_num)
 ver_build   := $(version)-$(build_num)
 name_ver    := $(name)-$(ver_build)
 rpm_src_dir := rpmbuild/SOURCES/$(name)-$(version)
-srctree     := .git src test include GNUmakefile .copr deb rpm
+srctree     := .git $(shell git ls-tree HEAD | awk '$$2 != "commit" { print $$4 }')
 release     := $(shell if [ -x /bin/rpmspec ] ; then \
                    /bin/rpmspec -q rpm/$(name).spec | head -1 | sed 's/.*999.999-99999.//' | sed 's/.src//' ; fi)
 -include build_depends.mak
