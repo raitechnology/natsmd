@@ -5,6 +5,11 @@
 #include <raikv/dlinklist.h>
 #include <raikv/key_hash.h>
 
+extern "C" {
+/* factory used by raims (dlsym / built in table) for the ipc transport */
+rai::kv::EvConnection *nats_create_connection( rai::kv::EvPoll *p,  rai::kv::RoutePublish *sr,
+                           rai::kv::EvConnectionNotify *n );
+}
 namespace rai {
 namespace natsmd {
 
