@@ -205,7 +205,8 @@ struct api_Transport : public EvConnectionNotify, public NatsClientCB,
   pthread_cond_t  cond;
   char          * daemon, * name, * user, * password, * auth_token, * descr;
   double          reconnect_secs;
-  uint32_t        inbox_count,
+  uint32_t        advisory,     /* natsTransportParams::advisory */
+                  inbox_count,
                   dup_hash,     /* consecutive copies of one publish, one */
                   dup_len,      /* per matching subscription: subject hash, */
                   dup_crc,      /* length and payload crc of the first, */
@@ -230,8 +231,10 @@ struct api_Transport : public EvConnectionNotify, public NatsClientCB,
   }
   void set_params( const natsTransportParams &p ) noexcept;
   EvNatsClientParameters client_params( void ) noexcept {
-    return EvNatsClientParameters( this->daemon, this->name, this->user,
-                                   this->password, this->auth_token );
+    EvNatsClientParameters p( this->daemon, this->name, this->user,
+                              this->password, this->auth_token );
+    p.advisory = this->advisory;
+    return p;
   }
   /* epoll thread */
   bool connect( void ) noexcept;
@@ -296,8 +299,12 @@ struct TportOp : public ApiOp {
       this->t.is_destroyed = true;
       this->t.api.poll.timer.remove_timer_cb( this->t, RECONNECT_TIMER_ID,
                                               this->t.id );
-      if ( this->t.client.fd != -1 )
-        this->t.client.idle_push( EV_CLOSE );
+      if ( this->t.client.fd != -1 ) {
+        if ( this->t.client.adv_started ) /* STOP, then flush and close */
+          this->t.client.do_shutdown();
+        else
+          this->t.client.idle_push( EV_CLOSE );
+      }
     }
   }
 };

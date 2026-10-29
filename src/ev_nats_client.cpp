@@ -12,6 +12,11 @@
 #include <raikv/bit_set.h>
 #include <raikv/pattern_cvt.h>
 #include <raimd/json_msg.h>
+#include <raimd/rv_msg.h>
+
+#ifndef SARG
+#define SARG( str ) str, sizeof( str )
+#endif
 
 using namespace rai;
 using namespace natsmd;
@@ -65,6 +70,9 @@ EvNatsClient::EvNatsClient( EvPoll &p,  RoutePublish &sr,
       next_sid( 1 ), protocol( 1 ), fwd_all_msgs( 0 ), fwd_all_subs( 1 ),
       max_payload( 1024 * 1024 ), sid_ht( 0 ),
       prefix_len( 0 ), session_len( 0 ),
+      start_time( 0 ), status_ival( NATS_STATUS_IVAL ), conn_count( 0 ),
+      sub_count( 0 ), sub_digest( 0 ),
+      subs_inbox_len( 0 ), advisory( false ), adv_started( false ),
       name( 0 ), lang( 0 ), version( 0 ), user( 0 ), pass( 0 ), auth_token( 0 ),
       param_buf( 0 )
 {
@@ -79,6 +87,9 @@ EvNatsClient::EvNatsClient( EvPoll &p ) noexcept
       next_sid( 1 ), protocol( 1 ), fwd_all_msgs( 0 ), fwd_all_subs( 1 ),
       max_payload( 1024 * 1024 ), sid_ht( 0 ),
       prefix_len( 0 ), session_len( 0 ),
+      start_time( 0 ), status_ival( NATS_STATUS_IVAL ), conn_count( 0 ),
+      sub_count( 0 ), sub_digest( 0 ),
+      subs_inbox_len( 0 ), advisory( false ), adv_started( false ),
       name( 0 ), lang( 0 ), version( 0 ), user( 0 ), pass( 0 ), auth_token( 0 ),
       param_buf( 0 )
 {
@@ -197,6 +208,8 @@ EvNatsClient::nats_connect( EvNatsClientParameters &p,
   this->auth_token = cat.cstr( p.auth_token );
   this->notify     = n;
   this->cb         = c;
+  if ( p.advisory != 0 )
+    this->enable_advisory( p.advisory == 1 ? NATS_STATUS_IVAL : p.advisory );
   return true;
 }
 
@@ -233,8 +246,10 @@ EvNatsClient::initialize_state( void ) noexcept
 void
 EvNatsClient::do_shutdown( void ) noexcept
 {
-  if ( this->fd != -1 )
+  if ( this->fd != -1 ) {
+    this->stop_advisory(); /* STOP is flushed before the close */
     this->idle_push( EV_SHUTDOWN );
+  }
 }
 
 void
@@ -468,6 +483,14 @@ EvNatsClient::fwd_pub( NatsMsg &msg ) noexcept
     printf( "fwd_pub(%.*s) reply(%.*s)\n",
             (int) pub.subject_len, pub.subject,
             (int) pub.reply_len, (char *) pub.reply );
+  /* _INBOX.<session>.SUBS is answered here, not forwarded */
+  if ( this->adv_started && sublen == this->subs_inbox_len &&
+       ::memcmp( sub, this->subs_inbox, sublen ) == 0 ) {
+    flow = this->on_subs_request( pub );
+    if ( frag != NULL )
+      delete frag;
+    return flow;
+  }
   /* negative sids are wildcard matches */
   if ( msg.sid[ 0 ] == '-' ) /* wild matches, check if another wild match */
     pmatch = this->possible_matches( sub[ 0 ] );
@@ -810,6 +833,8 @@ EvNatsClient::do_sub( uint32_t h,  const char *sub,  size_t sublen,
   this->sz += hdr.len();
   if ( nats_client_sub_verbose || nats_debug )
     printf( "%.*s", (int) hdr.len(), p );
+  if ( this->advisory && is_new && ! is_restricted_subject( sub, sublen ) )
+    this->listen_start( h, sub, sublen );
 }
 
 static inline bool
@@ -962,6 +987,8 @@ EvNatsClient::do_unsub( uint32_t h,  const char *sub,  size_t sublen ) noexcept
     this->sz += len;
     this->idle_push_write();
   }
+  if ( this->advisory && ! is_restricted_subject( sub, sublen ) )
+    this->listen_stop( h, sub, sublen, sid != 0 );
 }
 /* forward unsubscribe subject: UNSUB sid */
 void
@@ -1039,6 +1066,9 @@ EvNatsClient::do_psub( uint32_t h,  const char *prefix,
   this->sz += hdr.len();
   if ( nats_client_sub_verbose || nats_debug )
     printf( "%.*s", (int) hdr.len(), p );
+  if ( this->advisory && is_new &&
+       ! is_restricted_subject( prefix, prefix_len ) )
+    this->listen_start( h, &p[ 4 ], prefix_len + 1 ); /* <prefix>> */
 }
 /* forward pattern subscribe: SUB wildcard -sid */
 void
@@ -1122,6 +1152,12 @@ EvNatsClient::do_punsub( uint32_t h,  const char *prefix,
     if ( nats_client_sub_verbose || nats_debug )
       printf( "%.*s", (int) len, s );
     this->idle_push_write();
+  }
+  if ( this->advisory && ! is_restricted_subject( prefix, prefix_len ) ) {
+    char pat[ MAX_PRE + 1 ];
+    ::memcpy( pat, prefix, prefix_len );
+    pat[ prefix_len ] = '>';
+    this->listen_stop( h, pat, prefix_len + 1, sid != 0 );
   }
 }
 
@@ -1256,9 +1292,229 @@ EvNatsClient::parse_info( const char *buf,  size_t bufsz ) noexcept
       this->subscribe( s, ::strlen( s ), NULL, 0 );
     }
   }
+  if ( this->advisory )
+    this->start_advisory();
   /* done, notify connected, may be -ERR later if conn fails to authenticate */
   if ( this->notify != NULL )
     this->notify->on_connect( *this );
+}
+
+/* epoll thread, CONNECT sent: the SUBS inbox, START and the STATUS timer;
+ * after a reconnect the session is the same, so this is a re-announce and
+ * the LISTEN.STARTs follow from the re-subscribes */
+void
+EvNatsClient::start_advisory( void ) noexcept
+{
+  if ( this->session_len == 0 )
+    this->make_session(); /* subscribes _INBOX.<session>.> */
+  else {                  /* a reconnect or a caller that made the session */
+    char   inbox[ 8 + 64 ];
+    CatPtr p( inbox );
+    p.s( "_INBOX." ).x( this->session, this->session_len ).s( "." );
+    uint32_t h = kv_crc_c( inbox, p.len(),
+                           this->sub_route.prefix_seed( p.len() ) );
+    if ( this->pat_tab.find( h, inbox, p.len() ) == NULL )
+      this->subscribe_inbox();
+  }
+  /* the SUBS inbox is covered by the _INBOX.<session>.> pattern; a SUB of
+   * its own would deliver each request twice */
+  CatPtr p( this->subs_inbox );
+  p.s( "_INBOX." ).x( this->session, this->session_len ).s( ".SUBS" ).end();
+  this->subs_inbox_len = (uint16_t) p.len();
+  this->start_time  = kv_current_realtime_ns();
+  this->adv_started = true;
+  this->conn_count++; /* the re-subscribes that follow are silent */
+  this->send_advisory( SARG( "START" ), NULL, 0, 0 );
+  this->poll.timer.add_timer_seconds( this->fd, this->status_ival,
+                                      NATS_STATUS_TIMER_ID, 0 );
+  this->idle_push_write();
+}
+
+/* a graceful shutdown: STOP is queued ahead of the close; a lost
+ * connection never gets here, the peer times out the STATUS instead */
+void
+EvNatsClient::stop_advisory( void ) noexcept
+{
+  if ( ! this->adv_started )
+    return;
+  this->adv_started = false;
+  this->poll.timer.remove_timer( this->fd, NATS_STATUS_TIMER_ID, 0 );
+  this->send_advisory( SARG( "STOP" ), NULL, 0, 0 );
+  this->sub_tab.release();
+  this->sub_count  = 0;
+  this->sub_digest = 0;
+}
+
+/* a subscribe after a reconnect finds its subject still in sub_tab from
+ * the previous connection: no LISTEN.START, cn tells the peer to re-query */
+void
+EvNatsClient::listen_start( uint32_t h,  const char *sub,
+                            size_t sublen ) noexcept
+{
+  RouteLoc     loc;
+  NatsPrefix * e = this->sub_tab.upsert( h, sub, sublen, loc );
+  if ( e == NULL )
+    return;
+  bool is_new = loc.is_new;
+  e->sid = this->conn_count;
+  if ( is_new ) {
+    this->sub_count++;
+    this->sub_digest ^= kv_crc_c( sub, sublen, 0 );
+    this->send_advisory( SARG( "LISTEN.START" ), sub, sublen, 1 );
+  }
+}
+
+void
+EvNatsClient::listen_stop( uint32_t h,  const char *sub,  size_t sublen,
+                           bool connected ) noexcept
+{
+  if ( this->sub_tab.remove( h, sub, sublen ) != NULL ) {
+    this->sub_count--;
+    this->sub_digest ^= kv_crc_c( sub, sublen, 0 );
+    if ( connected )
+      this->send_advisory( SARG( "LISTEN.STOP" ), sub, sublen, 0 );
+  }
+}
+
+/* after a reconnect, entries not re-subscribed on this connection were
+ * dropped while disconnected; forget them so a later subscribe is new */
+void
+EvNatsClient::prune_sub_tab( void ) noexcept
+{
+  RouteLoc     loc;
+  NatsPrefix * e;
+  size_t       cnt = 0;
+  for ( e = this->sub_tab.first( loc ); e != NULL; e = this->sub_tab.next( loc ) )
+    if ( e->sid != this->conn_count )
+      cnt++;
+  while ( cnt > 0 ) {
+    for ( e = this->sub_tab.first( loc ); e != NULL;
+          e = this->sub_tab.next( loc ) ) {
+      if ( e->sid != this->conn_count ) {
+        this->sub_count--;
+        this->sub_digest ^= kv_crc_c( e->value, e->len, 0 );
+        this->sub_tab.remove( e->hash, e->value, e->len );
+        break; /* restart, the vec may have moved */
+      }
+    }
+    cnt--;
+  }
+}
+
+bool
+EvNatsClient::timer_expire( uint64_t timer_id,  uint64_t ) noexcept
+{
+  if ( timer_id != NATS_STATUS_TIMER_ID )
+    return false;
+  if ( ! this->adv_started )
+    return false; /* stop the timer */
+  this->prune_sub_tab();
+  this->send_advisory( SARG( "STATUS" ), NULL, 0, 0 );
+  this->idle_push_write();
+  return true;
+}
+
+/* _NATS.<session>.<kind> with the rv_host.cpp field names */
+void
+EvNatsClient::send_advisory( const char *kind,  size_t kind_len,
+                             const char *sub,  size_t sublen,
+                             uint32_t refcnt ) noexcept
+{
+  char   subject[ MAX_NATS_ADV_LEN ];
+  CatPtr p( subject );
+  if ( kind[ kind_len - 1 ] == '\0' )
+    kind_len--;
+  p.s( "_NATS." ).x( this->session, this->session_len ).s( "." )
+   .x( kind, kind_len ).end();
+
+  MDMsgMem    mem;
+  RvMsgWriter msg( mem, mem.make( 1024 ), 1024 );
+  msg.append_string( SARG( "id" ), this->session, this->session_len + 1 );
+  if ( sub != NULL ) { /* LISTEN.START / LISTEN.STOP */
+    msg.append_subject( SARG( "sub" ), sub, sublen );
+    msg.append_uint( SARG( "refcnt" ), refcnt );
+    msg.append_uint( SARG( "sc" ), this->sub_count );
+    msg.append_uint( SARG( "sx" ), this->sub_digest );
+  }
+  else {
+    uint64_t now = kv_current_realtime_ns(),
+             ms  = ( now / 1000000 ) % 1000,
+             s   = ( now / 1000000000 );
+    if ( kind_len != 4 ) { /* START, STATUS */
+      const char *u = this->user != NULL ? this->user :
+                      this->name != NULL ? this->name : "nobody";
+      msg.append_string( SARG( "user" ), u, ::strlen( u ) + 1 );
+      msg.append_uint( SARG( "cn" ), this->conn_count );
+      msg.append_uint( SARG( "sc" ), this->sub_count );
+      msg.append_uint( SARG( "sx" ), this->sub_digest );
+    }
+    msg.append_type( SARG( "time" ), ( s << 32 ) | ms, MD_DATETIME );
+    if ( kind_len == 6 ) { /* STATUS */
+      uint32_t up = (uint32_t) ( ( now - this->start_time ) / 1000000000 );
+      msg.append_uint( SARG( "up" ), up );
+      msg.append_uint( SARG( "ms" ), this->msgs_sent );
+      msg.append_uint( SARG( "bs" ), this->bytes_sent );
+      msg.append_uint( SARG( "mr" ), this->msgs_recv );
+      msg.append_uint( SARG( "br" ), this->bytes_recv );
+    }
+  }
+  size_t    buflen = msg.update_hdr();
+  EvPublish pub( subject, p.len(), NULL, 0, msg.buf, buflen,
+                 this->sub_route, *this, kv_crc_c( subject, p.len(), 0 ),
+                 RVMSG_TYPE_ID );
+  if ( nats_client_cmd_verbose || nats_debug )
+    printf( "advisory %.*s %.*s\n", (int) p.len(), subject, (int) sublen,
+            sub != NULL ? sub : "" );
+  this->publish2( pub, subject, p.len(), NULL, 0 );
+}
+
+/* the rvd _INBOX.<host>.DAEMON rpc, answered by the session itself:
+ * {op:get, what:sessions} -> [ session ]; otherwise the subscriptions:
+ * user, each subject / pattern as an unnamed subject field, end=1 */
+bool
+EvNatsClient::on_subs_request( EvPublish &pub ) noexcept
+{
+  if ( pub.reply_len == 0 )
+    return true;
+  bool want_sessions = false;
+  if ( pub.msg_len > 0 ) {
+    MDMsgMem      mem;
+    RvMsg       * m;
+    MDFieldIter * it;
+    MDReference   mref;
+    m = RvMsg::unpack_rv( (void *) pub.msg, 0, pub.msg_len, 0, NULL, mem );
+    if ( m != NULL && m->get_field_iter( it ) == 0 &&
+         it->find( SARG( "what" ), mref ) == 0 && mref.ftype == MD_STRING &&
+         mref.fsize >= 8 && ::memcmp( mref.fptr, "sessions", 8 ) == 0 )
+      want_sessions = true;
+  }
+  MDMsgMem    mem;
+  this->prune_sub_tab();
+  size_t      sz = 1024 + this->sub_tab.pop_count() * 64;
+  RvMsgWriter msg( mem, mem.make( sz ), sz );
+  if ( want_sessions ) {
+    msg.append_string( NULL, 0, this->session, this->session_len + 1 );
+  }
+  else {
+    const char *u = this->user != NULL ? this->user :
+                    this->name != NULL ? this->name : "nobody";
+    msg.append_string( SARG( "user" ), u, ::strlen( u ) + 1 );
+    RouteLoc     loc;
+    NatsPrefix * s;
+    for ( s = this->sub_tab.first( loc ); s != NULL;
+          s = this->sub_tab.next( loc ) ) /* subjects and <prefix>> patterns */
+      msg.append_subject( NULL, 0, s->value, s->len );
+    msg.append_int<int32_t>( SARG( "end" ), 1 );
+  }
+  size_t    buflen = msg.update_hdr();
+  EvPublish rpub( (const char *) pub.reply, pub.reply_len, NULL, 0, msg.buf,
+                  buflen, this->sub_route, *this,
+                  kv_crc_c( pub.reply, pub.reply_len, 0 ), RVMSG_TYPE_ID );
+  if ( nats_client_cmd_verbose || nats_debug )
+    printf( "subs reply %.*s\n", (int) pub.reply_len, (char *) pub.reply );
+  this->publish2( rpub, (const char *) pub.reply, pub.reply_len, NULL, 0 );
+  this->idle_push_write();
+  return true;
 }
 /* after closed, release memory used by protocol */
 void
@@ -1272,12 +1528,16 @@ EvNatsClient::release( void ) noexcept
     this->sub_route.remove_route_notify( *this );
   if ( this->notify != NULL )
     this->notify->on_shutdown( *this, this->err, this->err_len );
+  if ( this->adv_started ) { /* connection lost, no STOP possible */
+    this->adv_started = false;
+    this->poll.timer.remove_timer( this->fd, NATS_STATUS_TIMER_ID, 0 );
+  }
   this->release_fragments();
   if ( this->sid_ht != NULL ) {
     delete this->sid_ht;
     this->sid_ht = NULL;
   }
-  this->pat_tab.release();
+  this->pat_tab.release(); /* sub_tab stays: it is the advertised set */
   if ( this->param_buf != NULL ) {
     ::free( this->param_buf );
     this->param_buf = NULL; 

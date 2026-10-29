@@ -113,13 +113,15 @@ struct EvNatsClientParameters {
                opts;
   const struct addrinfo *ai;
   const char * k;
-  uint32_t     rte_id;
+  uint32_t     rte_id,
+               advisory;   /* != 0: session advisories, see EvNatsClient */
   EvNatsClientParameters( const char *h = NULL,  const char *n = NULL,
                           const char *u = NULL,  const char *x = NULL,
                           const char *t = NULL,  int p = 4222,
                           int o = kv::DEFAULT_TCP_CONNECT_OPTS )
     : host( h ), name( n ), lang( "C" ), version( NULL ), user( u ), pass( x ),
-      auth_token( t ), port( p ), opts( o ), ai( 0 ), k( 0 ), rte_id( 0 ) {}
+      auth_token( t ), port( p ), opts( o ), ai( 0 ), k( 0 ), rte_id( 0 ),
+      advisory( 0 ) {}
 };
 
 struct NatsClientCB {
@@ -128,6 +130,36 @@ struct NatsClientCB {
 };
 
 static const size_t MAX_NATS_INBOX_LEN = 88; /* _INBOX.<session>.<number> */
+
+/* Session advisories (EvNatsClientParameters::advisory != 0), the NATS
+ * counterpart of the rvd host/session advisories in sassrv rv_host.cpp,
+ * without a host: NATS has no flat-network host id.  Subjects are bare
+ * (no _<service>. prefix) and RVMSG encoded:
+ *   _NATS.<session>.START        id, user, cn, sc, sx, time
+ *   _NATS.<session>.STATUS       id, user, cn, sc, sx, time, up, ms, bs, mr, br
+ *   _NATS.<session>.STOP         id, time
+ *   _NATS.<session>.LISTEN.START id, sub, refcnt=1, sc, sx  (first SUB)
+ *   _NATS.<session>.LISTEN.STOP  id, sub, refcnt=0, sc, sx  (UNSUB)
+ * The subject lives in the body, not the advisory subject: a pattern
+ * like RSF.> can't be published.  cn counts the session's connections: a
+ * reconnect re-subscribes silently (no LISTEN.START replay) and bumps cn,
+ * a peer tracking the session re-requests the subscription list when cn
+ * changes, since the break may have lost subscriptions anyway.  NATS has
+ * no data-loss advisory, so a peer can't know it missed a LISTEN: sc is
+ * the number of advertised subjects and sx their digest, the xor of
+ * kv_crc_c( subject, len, 0 ) over the set (order independent, O(1) to
+ * maintain); both are the state after the LISTEN they ride on.  A peer
+ * recomputes them from what it holds (or from a SUBS reply) and
+ * re-requests the list when they differ.  _INBOX.
+ * and _NATS. subjects are never advertised (restricted, like _RV. in
+ * rvd).  A request on
+ * _INBOX.<session>.SUBS is answered on its reply subject like the rvd
+ * _INBOX.<host>.DAEMON rpc: {op:"get", what:"sessions"} -> the session as
+ * an unnamed string; anything else (e.g. what:"subscriptions") -> user,
+ * every subscribed subject/pattern as unnamed subject fields, end=1. */
+static const uint32_t NATS_STATUS_IVAL     = 90; /* STATUS period, secs */
+static const uint64_t NATS_STATUS_TIMER_ID = 0x4e415453; /* 'NATS' */
+static const size_t   MAX_NATS_ADV_LEN     = 7 + MAX_NATS_INBOX_LEN + 16;
 
 /* a connection to a NATS server */
 struct EvNatsClient : public kv::EvConnection, public kv::RouteNotify {
@@ -154,6 +186,18 @@ struct EvNatsClient : public kv::EvConnection, public kv::RouteNotify {
                   session_len;
 
   kv::StrArray<1> inter_subs, bcast_subs, listen_subs;
+  kv::RouteVec<NatsPrefix>    sub_tab;        /* advertised subjects and
+                   patterns (<prefix>>), survives a reconnect so the
+                   re-subscribes are silent; sid = cn at last subscribe */
+  uint64_t        start_time;   /* realtime ns of CONNECT, for STATUS up */
+  uint32_t        status_ival,  /* STATUS period secs (NATS_STATUS_IVAL) */
+                  conn_count,   /* cn: connections made by this session */
+                  sub_count,    /* sc: entries in sub_tab */
+                  sub_digest;   /* sx: xor of kv_crc_c( subject, len, 0 ) */
+  char            subs_inbox[ MAX_NATS_INBOX_LEN ]; /* _INBOX.<session>.SUBS */
+  uint16_t        subs_inbox_len;
+  bool            advisory,     /* the init switch: publish advisories */
+                  adv_started;  /* START sent, STOP owed */
   const char    * name,         /* CONNECT parm:  name="service" */
                 * lang,                        /* lang="C" */
                 * version,                     /* version="1.0" */
@@ -175,6 +219,27 @@ struct EvNatsClient : public kv::EvConnection, public kv::RouteNotify {
   }
   void make_session( void ) noexcept;
   void subscribe_inbox( void ) noexcept;
+  /* session advisories, see the comment above NATS_STATUS_IVAL */
+  void enable_advisory( uint32_t ival = NATS_STATUS_IVAL ) {
+    this->advisory    = true;
+    this->status_ival = ( ival == 0 ? NATS_STATUS_IVAL : ival );
+  }
+  static bool is_restricted_subject( const char *sub,  size_t sublen ) {
+    return sub[ 0 ] == '_' &&
+           ( ( sublen >= 7 && ::memcmp( sub, "_INBOX.", 7 ) == 0 ) ||
+             ( sublen >= 6 && ::memcmp( sub, "_NATS.", 6 ) == 0 ) );
+  }
+  void start_advisory( void ) noexcept;  /* after CONNECT: SUBS inbox, START */
+  void stop_advisory( void ) noexcept;   /* before shutdown: STOP */
+  void send_advisory( const char *kind,  size_t kind_len,  const char *sub,
+                      size_t sublen,  uint32_t refcnt ) noexcept;
+  /* do_sub / do_psub: LISTEN.START unless a re-subscribe after reconnect */
+  void listen_start( uint32_t h,  const char *sub,  size_t sublen ) noexcept;
+  void listen_stop( uint32_t h,  const char *sub,  size_t sublen,
+                    bool connected ) noexcept;
+  void prune_sub_tab( void ) noexcept; /* drop subs not re-subscribed */
+  bool on_subs_request( kv::EvPublish &pub ) noexcept;
+  virtual bool timer_expire( uint64_t timer_id,  uint64_t event_id ) noexcept;
   uint16_t make_inbox( char *inbox, uint64_t num ) noexcept;
   uint64_t is_inbox( const char *sub,  size_t sub_len ) noexcept;
   void initialize_state( void ) noexcept;

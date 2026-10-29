@@ -97,7 +97,7 @@ api_Transport::api_Transport( Nats_API &a,  natsId i ) noexcept
   : api( a ), id( i ), client( a.poll ), wild( 0 ), wild_cnt( 0 ),
     wild_size( 0 ), state_listener( 0 ), daemon( 0 ), name( 0 ), user( 0 ),
     password( 0 ), auth_token( 0 ), descr( 0 ),
-    reconnect_secs( DEFAULT_RECONNECT_SECS ), inbox_count( 1 ),
+    reconnect_secs( DEFAULT_RECONNECT_SECS ), advisory( 0 ), inbox_count( 1 ),
     dup_hash( 0 ), dup_len( 0 ), dup_crc( 0 ), dup_skip( 0 ),
     connected( false ), is_destroyed( false ), timer_armed( false ),
     connect_failed( false )
@@ -117,6 +117,7 @@ api_Transport::set_params( const natsTransportParams &p ) noexcept
   ApiCore::set_string( this->auth_token, p.auth_token );
   this->reconnect_secs = ( p.reconnect_secs == 0 ? DEFAULT_RECONNECT_SECS
                                                  : p.reconnect_secs );
+  this->advisory = ( p.advisory < 0 ? 0 : (uint32_t) p.advisory );
 }
 
 /* epoll thread: (re)connect the client; a refused connect is reported

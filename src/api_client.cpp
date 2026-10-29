@@ -116,13 +116,20 @@ main( int argc,  char *argv[] )
       secs = atof( argv[ ++i ] );
     else if ( ::strcmp( argv[ i ], "-T" ) == 0 && i + 1 < argc )
       timer_secs = atof( argv[ ++i ] );
+    else if ( ::strcmp( argv[ i ], "-A" ) == 0 ) {
+      parms.advisory = 1;
+      if ( i + 1 < argc && argv[ i + 1 ][ 0 ] >= '0' && argv[ i + 1 ][ 0 ] <= '9' )
+        parms.advisory = atoi( argv[ ++i ] );
+    }
     else if ( ::strcmp( argv[ i ], "-h" ) == 0 || argv[ i ][ 0 ] == '-' ) {
       fprintf( stderr,
         "%s [-d host:port] [-u user] [-z pass] [-a token] [-N name] [-g group]\n"
         "   [-p subject [-m text]] [-i subject] [-q] [-n msgs] [-t secs]\n"
-        "   [-T secs] subject ...\n"
+        "   [-T secs] [-A [secs]] subject ...\n"
         "  -d  server, default 127.0.0.1:4222\n"
         "  -N  CONNECT name\n"
+        "  -A  session advisories _NATS.<session>.* and the _INBOX.<session>.SUBS\n"
+        "      rpc, STATUS every secs (90)\n"
         "  -g  subscribe as a member of NATS queue group\n"
         "  -p  publish an RVMSG { text } on subject once connected\n"
         "  -m  the text to publish (hello)\n"
