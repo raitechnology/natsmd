@@ -3,7 +3,10 @@
  *
  * natsmd_api_client -- sample / test for the natsapi: connect, subscribe
  * subjects (or wildcards), print what arrives; optionally publish a
- * message (-p) and / or a request with an inbox reply (-i). */
+ * message (-p) and / or a request with an inbox reply (-i).  Messages are
+ * decoded with a sass dictionary: from cfiles (-c path or $cfile_path), or
+ * requested on _TIC.REPLY.SASS.DATA.DICTIONARY before subscribing, the way
+ * natsmd_client and sassrv subrv7test do; -x skips it. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +15,10 @@
 #include <time.h>
 #include <raimd/md_msg.h>
 #include <raimd/rv_msg.h>
+#include <raimd/md_dict.h>
+#include <raimd/cfile.h>
+#include <raimd/app_a.h>
+#include <raimd/enum_def.h>
 #include <natsmd/natsapi.h>
 
 using namespace rai;
@@ -20,6 +27,13 @@ using namespace md;
 static volatile int quit;
 static int          quiet;
 static uint32_t     msg_count, max_msgs;
+static MDDict     * dict;          /* decodes messages, NULL = no dict */
+static int          have_dict;     /* network dictionary arrived */
+
+static const char   DICT_SUBJ[]     = "_TIC.REPLY.SASS.DATA.DICTIONARY";
+static const double DICT_WAIT_SECS  = 3.0;  /* per request */
+static const int    DICT_TRIES      = 2;    /* requests before giving up */
+static const int    MAX_SUBJECTS    = 64;   /* ev[] */
 
 static void
 sig_handler( int )
@@ -65,8 +79,102 @@ on_msg( natsEvent,  natsMsg msg,  void *closure )
           reply[ 0 ] != '\0' ? " (reply: " : "", reply,
           reply[ 0 ] != '\0' ? ")" : "", len, enc,
           closure != NULL ? " [inbox]" : "" );
-  natsMsg_Print( msg, stdout );
+  if ( len == 0 ) {
+    fflush( stdout );
+    return;
+  }
+  MDMsgMem mem;
+  MDMsg  * m = MDMsg::unpack( (void *) data, 0, len, 0, dict, mem );
+  MDOutput out;
+  if ( m == NULL )
+    out.print_hex( data, len );
+  else
+    m->print( &out );
   fflush( stdout );
+}
+
+/* the reply to the _TIC.REPLY.SASS.DATA.DICTIONARY request */
+static void
+on_dict( natsEvent,  natsMsg msg,  void * )
+{
+  natsMsgClass cls  = NATS_MSG_DATA;
+  const void * data = NULL;
+  uint32_t     len  = 0;
+
+  natsMsg_GetMsgClass( msg, &cls );
+  if ( cls != NATS_MSG_DATA || have_dict )
+    return;
+  natsMsg_GetData( msg, &data, &len );
+  MDMsgMem mem;
+  MDMsg  * m = MDMsg::unpack( (void *) data, 0, len, 0, NULL, mem );
+  if ( m == NULL ) {
+    fprintf( stderr, "dict unpack error, len %u\n", len );
+    return;
+  }
+  MDDictBuild dict_build;
+  if ( CFile::unpack_sass( dict_build, m ) != 0 ) {
+    fprintf( stderr, "dict index error\n" );
+    return;
+  }
+  dict_build.index_dict( "cfile", dict );
+  have_dict = 1;
+  printf( "received dictionary, len %u\n", len );
+  fflush( stdout );
+}
+
+/* load cfile (and app_a for marketfeed) dictionaries from path */
+static void
+load_cfile_dict( const char *path )
+{
+  MDDictBuild dict_build;
+  if ( AppA::parse_path( dict_build, path, "RDMFieldDictionary" ) == 0 ) {
+    EnumDef::parse_path( dict_build, path, "enumtype.def" );
+    dict_build.index_dict( "app_a", dict );
+  }
+  dict_build.clear_build();
+  if ( CFile::parse_path( dict_build, path, "tss_fields.cf" ) == 0 ) {
+    CFile::parse_path( dict_build, path, "tss_records.cf" );
+    dict_build.index_dict( "cfile", dict );
+  }
+  if ( dict != NULL && dict->dict_type[ 0 ] == 'c' )
+    printf( "loaded dictionary from cfiles in %s\n", path );
+  else
+    printf( "no cfile dictionary in %s\n", path );
+}
+
+/* request the sass dictionary, dispatch until it arrives or times out */
+static void
+request_dict( natsTransport t,  natsQueue q )
+{
+  char        inbox[ NATS_MAX_INBOX_LEN ];
+  natsEvent   dict_ev = 0;
+  nats_status st;
+
+  natsTransport_CreateInbox( t, inbox, sizeof( inbox ) );
+  st = natsEvent_CreateListener( &dict_ev, q, t, inbox, NATS_LISTEN_DEFAULT,
+                                 on_dict, NULL );
+  if ( st != NATS_OK ) {
+    fprintf( stderr, "dict inbox %s: %s\n", inbox, natsStatus_GetText( st ) );
+    return;
+  }
+  for ( int i = 0; i < DICT_TRIES && ! have_dict && ! quit; i++ ) {
+    st = natsTransport_Send( t, DICT_SUBJ, inbox, "x", 1, 0 );
+    printf( "request %s reply %s: %s\n", DICT_SUBJ, inbox,
+            natsStatus_GetText( st ) );
+    fflush( stdout );
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    double t0 = ts.tv_sec + ts.tv_nsec / 1e9, now = t0;
+    while ( ! have_dict && ! quit && now - t0 < DICT_WAIT_SECS ) {
+      natsQueue_TimedDispatch( q, 0.1 );
+      clock_gettime( CLOCK_MONOTONIC, &ts );
+      now = ts.tv_sec + ts.tv_nsec / 1e9;
+    }
+    if ( ! have_dict )
+      printf( "dict request timeout%s\n",
+              i + 1 < DICT_TRIES ? ", trying again" : ", starting subs" );
+  }
+  natsEvent_Destroy( dict_ev );
 }
 
 static void
@@ -76,74 +184,90 @@ on_timer( natsEvent,  natsMsg,  void * )
   fflush( stdout );
 }
 
+static const char *
+get_arg( int &x, int argc, const char *argv[], int b, const char *f,
+         const char *g, const char *def ) noexcept
+{
+  for ( int i = 1; i < argc - b; i++ ) {
+    if ( ::strcmp( f, argv[ i ] ) == 0 || ::strcmp( g, argv[ i ] ) == 0 ) {
+      if ( x < i + b + 1 )
+        x = i + b + 1;
+      return argv[ i + b ];
+    }
+  }
+  return def; /* default value */
+}
+
 int
-main( int argc,  char *argv[] )
+main( int argc,  const char *argv[] )
 {
   natsTransportParams parms;
   nats_InitTransportParams( &parms );
-  const char * subjects[ 64 ],
-             * pub_subject = NULL,
-             * pub_text    = "hello",
-             * req_subject = NULL,
-             * queue_group = NULL;
-  int          nsubj = 0;
-  double       secs  = 0, timer_secs = 0;
 
-  for ( int i = 1; i < argc; i++ ) {
-    if ( ::strcmp( argv[ i ], "-d" ) == 0 && i + 1 < argc )
-      parms.daemon = argv[ ++i ];
-    else if ( ::strcmp( argv[ i ], "-u" ) == 0 && i + 1 < argc )
-      parms.user = argv[ ++i ];
-    else if ( ::strcmp( argv[ i ], "-z" ) == 0 && i + 1 < argc )
-      parms.password = argv[ ++i ];
-    else if ( ::strcmp( argv[ i ], "-a" ) == 0 && i + 1 < argc )
-      parms.auth_token = argv[ ++i ];
-    else if ( ::strcmp( argv[ i ], "-N" ) == 0 && i + 1 < argc )
-      parms.name = argv[ ++i ];
-    else if ( ::strcmp( argv[ i ], "-p" ) == 0 && i + 1 < argc )
-      pub_subject = argv[ ++i ];
-    else if ( ::strcmp( argv[ i ], "-m" ) == 0 && i + 1 < argc )
-      pub_text = argv[ ++i ];
-    else if ( ::strcmp( argv[ i ], "-i" ) == 0 && i + 1 < argc )
-      req_subject = argv[ ++i ];
-    else if ( ::strcmp( argv[ i ], "-g" ) == 0 && i + 1 < argc )
-      queue_group = argv[ ++i ];
-    else if ( ::strcmp( argv[ i ], "-q" ) == 0 )
-      quiet = 1;
-    else if ( ::strcmp( argv[ i ], "-n" ) == 0 && i + 1 < argc )
-      max_msgs = (uint32_t) atoi( argv[ ++i ] );
-    else if ( ::strcmp( argv[ i ], "-t" ) == 0 && i + 1 < argc )
-      secs = atof( argv[ ++i ] );
-    else if ( ::strcmp( argv[ i ], "-T" ) == 0 && i + 1 < argc )
-      timer_secs = atof( argv[ ++i ] );
-    else if ( ::strcmp( argv[ i ], "-A" ) == 0 ) {
-      parms.advisory = 1;
-      if ( i + 1 < argc && argv[ i + 1 ][ 0 ] >= '0' && argv[ i + 1 ][ 0 ] <= '9' )
-        parms.advisory = atoi( argv[ ++i ] );
-    }
-    else if ( ::strcmp( argv[ i ], "-h" ) == 0 || argv[ i ][ 0 ] == '-' ) {
-      fprintf( stderr,
-        "%s [-d host:port] [-u user] [-z pass] [-a token] [-N name] [-g group]\n"
-        "   [-p subject [-m text]] [-i subject] [-q] [-n msgs] [-t secs]\n"
-        "   [-T secs] [-A [secs]] subject ...\n"
-        "  -d  server, default 127.0.0.1:4222\n"
-        "  -N  CONNECT name\n"
-        "  -A  session advisories _NATS.<session>.* and the _INBOX.<session>.SUBS\n"
-        "      rpc, STATUS every secs (90)\n"
-        "  -g  subscribe as a member of NATS queue group\n"
-        "  -p  publish an RVMSG { text } on subject once connected\n"
-        "  -m  the text to publish (hello)\n"
-        "  -i  send a request on subject with an inbox reply, print replies\n"
-        "  -q  count only\n"
-        "  -n  quit after msgs messages\n"
-        "  -t  quit after secs\n"
-        "  -T  a timer event every secs\n"
-        "  subject  subscribe (wildcards A.*.C, A.> allowed)\n", argv[ 0 ] );
-      return 1;
-    }
-    else if ( nsubj < 64 )
-      subjects[ nsubj++ ] = argv[ i ];
+  int x = 1;
+  const char * host        = get_arg( x, argc, argv, 1, "-d", "-host", "tcp:4222" ),
+             * name        = get_arg( x, argc, argv, 1, "-N", "-name", "api_client"),
+             * user        = get_arg( x, argc, argv, 1, "-u", "-user", "nobody" ),
+             * pass        = get_arg( x, argc, argv, 1, "-z", "-pass", NULL ),
+             * token       = get_arg( x, argc, argv, 1, "-a", "-token", NULL ),
+             * path        = get_arg( x, argc, argv, 1, "-c", "-cfile", NULL ),
+             * nodict      = get_arg( x, argc, argv, 0, "-x", "-nodict", NULL ),
+             * advisory    = get_arg( x, argc, argv, 0, "-A", "-advisory", NULL ),
+             * pub_subject = get_arg( x, argc, argv, 1, "-p", "-pub_subject", NULL ),
+             * pub_text    = get_arg( x, argc, argv, 1, "-m", "-pub_text", "hello" ),
+             * req_subject = get_arg( x, argc, argv, 1, "-i", "-req_subject", NULL ),
+             * queue_group = get_arg( x, argc, argv, 1, "-g", "-queue_group", NULL ),
+             * max_msgs_s  = get_arg( x, argc, argv, 1, "-n", "-max_msgs", NULL ),
+             * secs_s      = get_arg( x, argc, argv, 1, "-t", "-secs", NULL ),
+             * timer_secs_s= get_arg( x, argc, argv, 1, "-T", "-timer_secs", NULL ),
+             * quiet_s     = get_arg( x, argc, argv, 0, "-q", "-quiet", NULL ),
+             * help        = get_arg( x, argc, argv, 0, "-h", "-help", 0 );
+
+  const char ** subjects   = NULL;
+  int           nsubj = 0;
+  double        secs  = 0, timer_secs = 0;
+
+  if ( help != NULL ) {
+    fprintf( stderr,
+      "%s [-d host:port] [-u user] [-z pass] [-a token] [-N name] [-g group]\n"
+      "   [-c cfile_path] [-x] [-p subject [-m text]] [-i subject] [-q]\n"
+      "   [-n msgs] [-t secs] [-T secs] [-A [secs]] subject ...\n"
+      "  -d  server, default 127.0.0.1:4222\n"
+      "  -N  CONNECT name\n"
+      "  -c  load the dictionary from cfiles in path ($cfile_path)\n"
+      "  -x  don't load a dictionary, otherwise request one on\n"
+      "      _TIC.REPLY.SASS.DATA.DICTIONARY before subscribing\n"
+      "  -A  session advisories _NATS.<KIND>.<session> and the _INBOX.<session>.SUBS\n"
+      "      rpc, STATUS every secs (90)\n"
+      "  -g  subscribe as a member of NATS queue group\n"
+      "  -p  publish an RVMSG { text } on subject once connected\n"
+      "  -m  the text to publish (hello)\n"
+      "  -i  send a request on subject with an inbox reply, print replies\n"
+      "  -q  count only\n"
+      "  -n  quit after msgs messages\n"
+      "  -t  quit after secs\n"
+      "  -T  a timer event every secs\n"
+      "  subject  subscribe (wildcards A.*.C, A.> allowed)\n", argv[ 0 ] );
+    return 1;
   }
+  subjects = &argv[ x ];
+  nsubj    = argc - x;
+  if ( nsubj > MAX_SUBJECTS ) {
+    fprintf( stderr, "too many subjects, max %d\n", MAX_SUBJECTS );
+    return 1;
+  }
+  parms.daemon     = host;
+  parms.user       = user;
+  parms.password   = pass;
+  parms.auth_token = token;
+  parms.name       = name;
+  parms.advisory   = ( advisory ? 1 : 0 );
+
+  quiet      = ( quiet_s ? 1 : 0 );
+  max_msgs   = ( max_msgs_s ? (uint32_t) atoi( max_msgs_s ) : 0 );
+  secs       = ( secs_s ? atof( secs_s ) : 0 );
+  timer_secs = ( timer_secs_s ? atof( timer_secs_s ) : 0 );
+
   signal( SIGINT, sig_handler );
   signal( SIGTERM, sig_handler );
 
@@ -163,17 +287,9 @@ main( int argc,  char *argv[] )
   natsQueue_Create( &q );
   natsTransport_SetStateListener( t, q, on_msg, NULL, &state_ev );
 
-  /* listeners may be created before the connect, they are subscribed
-   * when it completes */
-  for ( int i = 0; i < nsubj; i++ ) {
-    st = natsEvent_CreateQueueListener( &ev[ i ], q, t, subjects[ i ],
-                                        queue_group, NATS_LISTEN_DEFAULT,
-                                        on_msg, NULL );
-    if ( st != NATS_OK )
-      printf( "listen %s: %s\n", subjects[ i ], natsStatus_GetText( st ) );
-    else
-      printf( "listen %s\n", subjects[ i ] );
-  }
+  if ( nodict == NULL &&
+       ( path != NULL || (path = ::getenv( "cfile_path" )) != NULL ) )
+    load_cfile_dict( path );
   if ( timer_secs > 0 )
     natsEvent_CreateTimer( &timer_ev, q, on_timer, timer_secs, NULL );
 
@@ -187,6 +303,21 @@ main( int argc,  char *argv[] )
   uint32_t max_payload = 0;
   natsTransport_GetMaxPayload( t, &max_payload );
   printf( "connected, max_payload %u\n", max_payload );
+
+  /* without a cfile dict, ask the network for one before subscribing, so
+   * the initial values decode */
+  if ( nodict == NULL && ( dict == NULL || dict->dict_type[ 0 ] != 'c' ) )
+    request_dict( t, q );
+
+  for ( int i = 0; i < nsubj; i++ ) {
+    st = natsEvent_CreateQueueListener( &ev[ i ], q, t, subjects[ i ],
+                                        queue_group, NATS_LISTEN_DEFAULT,
+                                        on_msg, NULL );
+    if ( st != NATS_OK )
+      printf( "listen %s: %s\n", subjects[ i ], natsStatus_GetText( st ) );
+    else
+      printf( "listen %s\n", subjects[ i ] );
+  }
 
   /* an RVMSG { text : "..." } payload */
   MDMsgMem    mem;

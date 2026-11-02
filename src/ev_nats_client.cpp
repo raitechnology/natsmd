@@ -71,7 +71,7 @@ EvNatsClient::EvNatsClient( EvPoll &p,  RoutePublish &sr,
       max_payload( 1024 * 1024 ), sid_ht( 0 ),
       prefix_len( 0 ), session_len( 0 ),
       start_time( 0 ), status_ival( NATS_STATUS_IVAL ), conn_count( 0 ),
-      sub_count( 0 ), sub_digest( 0 ),
+      sub_count( 0 ), sub_digest( 0 ), adv_seqno( 0 ),
       subs_inbox_len( 0 ), advisory( false ), adv_started( false ),
       name( 0 ), lang( 0 ), version( 0 ), user( 0 ), pass( 0 ), auth_token( 0 ),
       param_buf( 0 )
@@ -88,7 +88,7 @@ EvNatsClient::EvNatsClient( EvPoll &p ) noexcept
       max_payload( 1024 * 1024 ), sid_ht( 0 ),
       prefix_len( 0 ), session_len( 0 ),
       start_time( 0 ), status_ival( NATS_STATUS_IVAL ), conn_count( 0 ),
-      sub_count( 0 ), sub_digest( 0 ),
+      sub_count( 0 ), sub_digest( 0 ), adv_seqno( 0 ),
       subs_inbox_len( 0 ), advisory( false ), adv_started( false ),
       name( 0 ), lang( 0 ), version( 0 ), user( 0 ), pass( 0 ), auth_token( 0 ),
       param_buf( 0 )
@@ -321,6 +321,7 @@ EvNatsClient::make_session( void ) noexcept
   this->session_len =
     bin_to_base64( x, sizeof( x ), this->session, false );
   this->session[ this->session_len ] = '\0';
+  this->adv_seqno = 0; /* a new session name starts a new sequence */
   for ( size_t i = 0; i < this->session_len; i++ ) {
     if ( this->session[ i ] == '+' || this->session[ i ] == '/' ) {
       this->session[ i ] = 'a' + ( now % 26 );
@@ -483,6 +484,26 @@ EvNatsClient::fwd_pub( NatsMsg &msg ) noexcept
     printf( "fwd_pub(%.*s) reply(%.*s)\n",
             (int) pub.subject_len, pub.subject,
             (int) pub.reply_len, (char *) pub.reply );
+  /* _INBOX.<session>.I.<subject>: the initial for a LISTEN.START, it is
+   * delivered as a message on <subject> -- only this subscriber asked */
+  if ( this->session_len > 0 && sublen > 7 + (size_t) this->session_len + 3 &&
+       ::memcmp( sub, "_INBOX.", 7 ) == 0 &&
+       ::memcmp( &sub[ 7 ], this->session, this->session_len ) == 0 &&
+       ::memcmp( &sub[ 7 + this->session_len ], ".I.", 3 ) == 0 ) {
+    const char * isub = &sub[ 7 + this->session_len + 3 ];
+    size_t       ilen = sublen - ( 7 + this->session_len + 3 );
+    NatsStr      xisub( isub, ilen );
+    EvPublish    ipub( isub, ilen, rep, replen, pub.msg, pub.msg_len,
+                       this->sub_route, *this, xisub.hash(), MD_STRING );
+    ipub.hdr_len = pub.hdr_len;
+    if ( this->cb != NULL )
+      flow = this->cb->on_nats_msg( ipub );
+    else
+      flow = this->sub_route.forward_msg( ipub );
+    if ( frag != NULL )
+      delete frag;
+    return flow;
+  }
   /* _INBOX.<session>.SUBS is answered here, not forwarded */
   if ( this->adv_started && sublen == this->subs_inbox_len &&
        ::memcmp( sub, this->subs_inbox, sublen ) == 0 ) {
@@ -1360,7 +1381,26 @@ EvNatsClient::listen_start( uint32_t h,  const char *sub,
   if ( is_new ) {
     this->sub_count++;
     this->sub_digest ^= kv_crc_c( sub, sublen, 0 );
-    this->send_advisory( SARG( "LISTEN.START" ), sub, sublen, 1 );
+    /* a subject listen asks for its initial on _INBOX.<session>.I.<sub>,
+     * a wildcard has no single image to ask for */
+    bool is_wild = false;
+    for ( size_t i = 0; i < sublen; i++ ) {
+      if ( ( sub[ i ] == '*' || sub[ i ] == '>' ) &&
+           ( i == 0 || sub[ i - 1 ] == '.' ) &&
+           ( i + 1 == sublen || sub[ i + 1 ] == '.' ) ) {
+        is_wild = true;
+        break;
+      }
+    }
+    if ( is_wild || this->session_len == 0 )
+      this->send_advisory( SARG( "LISTEN.START" ), sub, sublen, 1 );
+    else {
+      CatMalloc rep( 7 + this->session_len + 3 + sublen + 1 );
+      rep.s( "_INBOX." ).x( this->session, this->session_len ).s( ".I." )
+         .x( sub, sublen ).end();
+      this->send_advisory( SARG( "LISTEN.START" ), sub, sublen, 1,
+                           rep.start, rep.len() );
+    }
   }
 }
 
@@ -1368,7 +1408,7 @@ void
 EvNatsClient::listen_stop( uint32_t h,  const char *sub,  size_t sublen,
                            bool connected ) noexcept
 {
-  if ( this->sub_tab.remove( h, sub, sublen ) != NULL ) {
+  if ( this->sub_tab.remove( h, sub, sublen ) ) {
     this->sub_count--;
     this->sub_digest ^= kv_crc_c( sub, sublen, 0 );
     if ( connected )
@@ -1414,22 +1454,27 @@ EvNatsClient::timer_expire( uint64_t timer_id,  uint64_t ) noexcept
   return true;
 }
 
-/* _NATS.<session>.<kind> with the rv_host.cpp field names */
+/* _NATS.<kind>.<session> with the rv_host.cpp field names; the kind leads
+ * so a monitor subscribes _NATS.LISTEN.START.> etc */
 void
 EvNatsClient::send_advisory( const char *kind,  size_t kind_len,
                              const char *sub,  size_t sublen,
-                             uint32_t refcnt ) noexcept
+                             uint32_t refcnt,  const char *reply,
+                             size_t reply_len ) noexcept
 {
   char   subject[ MAX_NATS_ADV_LEN ];
   CatPtr p( subject );
   if ( kind[ kind_len - 1 ] == '\0' )
     kind_len--;
-  p.s( "_NATS." ).x( this->session, this->session_len ).s( "." )
-   .x( kind, kind_len ).end();
+  p.s( "_NATS." ).x( kind, kind_len ).s( "." )
+   .x( this->session, this->session_len ).end();
 
   MDMsgMem    mem;
   RvMsgWriter msg( mem, mem.make( 1024 ), 1024 );
   msg.append_string( SARG( "id" ), this->session, this->session_len + 1 );
+  /* sq orders the advisories and the SUBS reply of this session, which
+   * travel on different subjects */
+  msg.append_uint( SARG( "sq" ), ++this->adv_seqno );
   if ( sub != NULL ) { /* LISTEN.START / LISTEN.STOP */
     msg.append_subject( SARG( "sub" ), sub, sublen );
     msg.append_uint( SARG( "refcnt" ), refcnt );
@@ -1459,13 +1504,13 @@ EvNatsClient::send_advisory( const char *kind,  size_t kind_len,
     }
   }
   size_t    buflen = msg.update_hdr();
-  EvPublish pub( subject, p.len(), NULL, 0, msg.buf, buflen,
+  EvPublish pub( subject, p.len(), reply, reply_len, msg.buf, buflen,
                  this->sub_route, *this, kv_crc_c( subject, p.len(), 0 ),
-                 RVMSG_TYPE_ID );
+                 RVMSG_TYPE_ID, PUB_TYPE_SERIAL );
   if ( nats_client_cmd_verbose || nats_debug )
     printf( "advisory %.*s %.*s\n", (int) p.len(), subject, (int) sublen,
             sub != NULL ? sub : "" );
-  this->publish2( pub, subject, p.len(), NULL, 0 );
+  this->publish2( pub, subject, p.len(), reply, reply_len );
 }
 
 /* the rvd _INBOX.<host>.DAEMON rpc, answered by the session itself:
@@ -1499,6 +1544,9 @@ EvNatsClient::on_subs_request( EvPublish &pub ) noexcept
     const char *u = this->user != NULL ? this->user :
                     this->name != NULL ? this->name : "nobody";
     msg.append_string( SARG( "user" ), u, ::strlen( u ) + 1 );
+    /* the state as of advisory sq, not incremented: other monitors would
+     * see a gap */
+    msg.append_uint( SARG( "sq" ), this->adv_seqno );
     RouteLoc     loc;
     NatsPrefix * s;
     for ( s = this->sub_tab.first( loc ); s != NULL;
@@ -1509,7 +1557,8 @@ EvNatsClient::on_subs_request( EvPublish &pub ) noexcept
   size_t    buflen = msg.update_hdr();
   EvPublish rpub( (const char *) pub.reply, pub.reply_len, NULL, 0, msg.buf,
                   buflen, this->sub_route, *this,
-                  kv_crc_c( pub.reply, pub.reply_len, 0 ), RVMSG_TYPE_ID );
+                  kv_crc_c( pub.reply, pub.reply_len, 0 ), RVMSG_TYPE_ID,
+                  PUB_TYPE_SERIAL );
   if ( nats_client_cmd_verbose || nats_debug )
     printf( "subs reply %.*s\n", (int) pub.reply_len, (char *) pub.reply );
   this->publish2( rpub, (const char *) pub.reply, pub.reply_len, NULL, 0 );

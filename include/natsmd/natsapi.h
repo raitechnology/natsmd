@@ -110,8 +110,8 @@ typedef struct {
   double       reconnect_secs; /* retry interval after a disconnect,
                                 * 0 = default (1s), < 0 = don't reconnect */
   int          advisory;     /* session advisories for a nats-server (not
-                              * raims) network: _NATS.<session>.START/STATUS/
-                              * STOP, LISTEN.START/STOP, and the subscription
+                              * raims) network: _NATS.START/STATUS/STOP.<session>,
+                              * _NATS.LISTEN.START/STOP.<session>, and the subscription
                               * list rpc on _INBOX.<session>.SUBS; 0 = off,
                               * 1 = on with a 90s STATUS, > 1 = STATUS secs */
 } natsTransportParams;

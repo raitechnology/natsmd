@@ -247,7 +247,7 @@ gen_files   :=
 ev_nats_defines := -DNATSMD_VER=$(ver_build)
 $(objd)/ev_nats.o : .copr/Makefile
 $(objd)/ev_nats.fpic.o : .copr/Makefile
-libnatsmd_files := ev_nats ev_nats_client
+libnatsmd_files := ev_nats ev_nats_client submgr
 libnatsmd_cfile := $(addprefix src/, $(addsuffix .cpp, $(libnatsmd_files)))
 libnatsmd_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(libnatsmd_files)))
 libnatsmd_dbjs  := $(addprefix $(objd)/, $(addsuffix .fpic.o, $(libnatsmd_files)))
@@ -288,7 +288,6 @@ all_dlls    += $(libd)/libnatsapi.$(dll)
 all_depends += $(libnatsapi_deps)
 natsapi_lib := $(libd)/libnatsapi.a
 
-# api sample / test: subscribe and publish with the api, print messages
 natsmd_api_client_files := api_client
 natsmd_api_client_cfile := $(addprefix src/, $(addsuffix .cpp, $(natsmd_api_client_files)))
 natsmd_api_client_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(natsmd_api_client_files)))
@@ -300,6 +299,18 @@ $(bind)/natsmd_api_client$(exe): $(natsmd_api_client_objs) $(natsmd_api_client_l
 
 all_exes    += $(bind)/natsmd_api_client$(exe)
 all_depends += $(natsmd_api_client_deps)
+
+natsmd_sq_test_files := sq_test
+natsmd_sq_test_cfile := $(addprefix src/, $(addsuffix .cpp, $(natsmd_sq_test_files)))
+natsmd_sq_test_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(natsmd_sq_test_files)))
+natsmd_sq_test_deps  := $(addprefix $(dependd)/, $(addsuffix .d, $(natsmd_sq_test_files)))
+natsmd_sq_test_libs  := $(natsapi_lib) $(natsmd_lib)
+natsmd_sq_test_lnk   := $(natsapi_lib) $(natsmd_lib) $(lnk_lib)
+
+$(bind)/natsmd_sq_test$(exe): $(natsmd_sq_test_objs) $(natsmd_sq_test_libs) $(lnk_dep)
+
+#all_exes    += $(bind)/natsmd_sq_test$(exe)
+#all_depends += $(natsmd_sq_test_deps)
 
 server_defines := -DNATSMD_VER=$(ver_build)
 $(objd)/server.o : .copr/Makefile
@@ -368,6 +379,18 @@ $(bind)/natsmd_pub$(exe): $(natsmd_pub_objs) $(natsmd_pub_libs) $(lnk_dep)
 all_exes    += $(bind)/natsmd_pub$(exe)
 all_depends += $(natsmd_pub_deps)
 
+natsmd_subtop_files := subtop
+natsmd_subtop_cfile := $(addprefix src/, $(addsuffix .cpp, $(natsmd_subtop_files)))
+natsmd_subtop_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(natsmd_subtop_files)))
+natsmd_subtop_deps  := $(addprefix $(dependd)/, $(addsuffix .d, $(natsmd_subtop_files)))
+natsmd_subtop_libs  := $(natsmd_lib)
+natsmd_subtop_lnk   := $(natsmd_lib) $(lnk_lib)
+
+$(bind)/natsmd_subtop$(exe): $(natsmd_subtop_objs) $(natsmd_subtop_libs) $(lnk_dep)
+
+all_exes    += $(bind)/natsmd_subtop$(exe)
+all_depends += $(natsmd_subtop_deps)
+
 all_dirs := $(bind) $(libd) $(objd) $(dependd)
 
 # the default targets
@@ -412,14 +435,15 @@ $(dependd)/depend.make: $(dependd) $(all_depends)
 	@cat $(all_depends) >> $(dependd)/depend.make
 
 .PHONY: dist_bins
-dist_bins: $(all_libs) $(all_dlls) $(bind)/natsmd_server$(exe) $(bind)/natsmd_client$(exe) $(bind)/natsmd_pub$(exe) $(bind)/ping_nats$(exe) $(bind)/natsmd_api_client$(exe)
+dist_bins: $(all_libs) $(all_dlls) $(bind)/natsmd_server$(exe) $(bind)/natsmd_client$(exe) $(bind)/natsmd_pub$(exe) \
+           $(bind)/natsmd_api_client$(exe) $(bind)/natsmd_subtop$(exe)
 	chrpath -d $(libd)/libnatsmd.$(dll)
 	chrpath -d $(libd)/libnatsapi.$(dll)
 	chrpath -d $(bind)/natsmd_server$(exe)
 	chrpath -d $(bind)/natsmd_client$(exe)
 	chrpath -d $(bind)/natsmd_pub$(exe)
-	chrpath -d $(bind)/ping_nats$(exe)
 	chrpath -d $(bind)/natsmd_api_client$(exe)
+	chrpath -d $(bind)/natsmd_subtop$(exe)
 
 .PHONY: dist_rpm
 dist_rpm: srpm

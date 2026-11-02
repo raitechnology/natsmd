@@ -135,11 +135,17 @@ static const size_t MAX_NATS_INBOX_LEN = 88; /* _INBOX.<session>.<number> */
  * counterpart of the rvd host/session advisories in sassrv rv_host.cpp,
  * without a host: NATS has no flat-network host id.  Subjects are bare
  * (no _<service>. prefix) and RVMSG encoded:
- *   _NATS.<session>.START        id, user, cn, sc, sx, time
- *   _NATS.<session>.STATUS       id, user, cn, sc, sx, time, up, ms, bs, mr, br
- *   _NATS.<session>.STOP         id, time
- *   _NATS.<session>.LISTEN.START id, sub, refcnt=1, sc, sx  (first SUB)
- *   _NATS.<session>.LISTEN.STOP  id, sub, refcnt=0, sc, sx  (UNSUB)
+ *   _NATS.START.<session>        id, user, cn, sc, sx, time
+ *   _NATS.STATUS.<session>       id, user, cn, sc, sx, time, up, ms, bs, mr, br
+ *   _NATS.STOP.<session>         id, time
+ *   _NATS.LISTEN.START.<session> id, sub, refcnt=1, sc, sx  (first SUB)
+ *   _NATS.LISTEN.STOP.<session>  id, sub, refcnt=0, sc, sx  (UNSUB)
+ * The kind leads and the session trails, so _NATS.<KIND>.> sees every
+ * session's advisories of one kind (NatsSubscriptionDB in submgr.h).
+ * A LISTEN.START of a subject (not a wildcard) carries the reply
+ * _INBOX.<session>.I.<subject>: a cache answers it with the INITIAL, which
+ * fwd_pub() delivers as a message on <subject> to this subscriber only
+ * (the rv5 initial-on-listen; no INITIAL broadcast to other listeners).
  * The subject lives in the body, not the advisory subject: a pattern
  * like RSF.> can't be published.  cn counts the session's connections: a
  * reconnect re-subscribes silently (no LISTEN.START replay) and bumps cn,
@@ -193,7 +199,11 @@ struct EvNatsClient : public kv::EvConnection, public kv::RouteNotify {
   uint32_t        status_ival,  /* STATUS period secs (NATS_STATUS_IVAL) */
                   conn_count,   /* cn: connections made by this session */
                   sub_count,    /* sc: entries in sub_tab */
-                  sub_digest;   /* sx: xor of kv_crc_c( subject, len, 0 ) */
+                  sub_digest,   /* sx: xor of kv_crc_c( subject, len, 0 ) */
+                  adv_seqno;    /* sq: +1 per advisory of this session, the
+                                 * SUBS reply carries the current value; a
+                                 * monitor drops what is older than what it
+                                 * applied and re-queries on a gap */
   char            subs_inbox[ MAX_NATS_INBOX_LEN ]; /* _INBOX.<session>.SUBS */
   uint16_t        subs_inbox_len;
   bool            advisory,     /* the init switch: publish advisories */
@@ -232,7 +242,8 @@ struct EvNatsClient : public kv::EvConnection, public kv::RouteNotify {
   void start_advisory( void ) noexcept;  /* after CONNECT: SUBS inbox, START */
   void stop_advisory( void ) noexcept;   /* before shutdown: STOP */
   void send_advisory( const char *kind,  size_t kind_len,  const char *sub,
-                      size_t sublen,  uint32_t refcnt ) noexcept;
+                      size_t sublen,  uint32_t refcnt,
+                      const char *reply = NULL,  size_t reply_len = 0 ) noexcept;
   /* do_sub / do_psub: LISTEN.START unless a re-subscribe after reconnect */
   void listen_start( uint32_t h,  const char *sub,  size_t sublen ) noexcept;
   void listen_stop( uint32_t h,  const char *sub,  size_t sublen,

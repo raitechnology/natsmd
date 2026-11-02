@@ -270,17 +270,18 @@ main( int argc, const char *argv[] )
 {
   SignalHandler sighndl;
   int x = 1;
-  const char * host    = get_arg( x, argc, argv, 1, "-d", "-host", "tcp:4222" ),
-             * name    = get_arg( x, argc, argv, 1, "-n", "-name", "client"),
-             * user    = get_arg( x, argc, argv, 1, "-u", "-user", "nobody" ),
-             * pass    = get_arg( x, argc, argv, 1, "-z", "-pass", NULL ),
-             * token   = get_arg( x, argc, argv, 1, "-t", "-token", NULL ),
-             * path    = get_arg( x, argc, argv, 1, "-c", "-cfile", NULL ),
-             * nodict  = get_arg( x, argc, argv, 0, "-x", "-nodict", NULL ),
-             * dump    = get_arg( x, argc, argv, 0, "-e", "-hex", NULL ),
-             * rate    = get_arg( x, argc, argv, 0, "-r", "-rate", NULL ),
-             * queue   = get_arg( x, argc, argv, 1, "-q", "-queue", NULL ),
-             * help    = get_arg( x, argc, argv, 0, "-h", "-help", 0 );
+  const char * host     = get_arg( x, argc, argv, 1, "-d", "-host", "tcp:4222" ),
+             * name     = get_arg( x, argc, argv, 1, "-N", "-name", "client"),
+             * user     = get_arg( x, argc, argv, 1, "-u", "-user", "nobody" ),
+             * pass     = get_arg( x, argc, argv, 1, "-z", "-pass", NULL ),
+             * token    = get_arg( x, argc, argv, 1, "-t", "-token", NULL ),
+             * path     = get_arg( x, argc, argv, 1, "-c", "-cfile", NULL ),
+             * nodict   = get_arg( x, argc, argv, 0, "-x", "-nodict", NULL ),
+             * advisory = get_arg( x, argc, argv, 0, "-A", "-advisory", NULL ),
+             * dump     = get_arg( x, argc, argv, 0, "-e", "-hex", NULL ),
+             * rate     = get_arg( x, argc, argv, 0, "-r", "-rate", NULL ),
+             * queue    = get_arg( x, argc, argv, 1, "-q", "-queue", NULL ),
+             * help     = get_arg( x, argc, argv, 0, "-h", "-help", 0 );
   int first_sub = x, idle_count = 0;
 
   if ( help != NULL ) {
@@ -288,10 +289,11 @@ main( int argc, const char *argv[] )
     fprintf( stderr,
  "%s [-d host] [-n name] [-u user] [-p pass] [-t token] [-c cfile_path] [-x] [-e] subject ...\n"
              "  -d host    = daemon port to connect\n"
-             "  -n name    = program name\n"
+             "  -N name    = program name\n"
              "  -u user    = user name\n"
              "  -z pass    = user pass\n"
              "  -t token   = user token\n"
+             "  -A         = session advisories _NATS.<KIND>.<session>\n"
              "  -c cfile   = if loading dictionary from files\n"
              "  -x         = don't load a dictionary\n"
              "  -e         = show hex dump of messages\n"
@@ -311,6 +313,7 @@ main( int argc, const char *argv[] )
   EvNatsClient           conn( poll );
   NatsDataCallback       data( poll, conn, &argv[ first_sub ], argc - first_sub,
                             queue, nodict != NULL, dump != NULL, rate != NULL );
+  parm.advisory = ( advisory != NULL );
   /* load dictionary if present */
   if ( ! data.no_dictionary ) {
     if ( path != NULL || (path = ::getenv( "cfile_path" )) != NULL ) {
